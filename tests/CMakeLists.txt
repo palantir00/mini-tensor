@@ -1,8 +1,10 @@
 include(GoogleTest)
 
-add_executable(test_hello test_hello.cpp)
-target_link_libraries(test_hello PRIVATE GTest::gtest_main)
-mt_set_warnings(test_hello)
+# One test executable for the whole project; ctest still sees every TEST() separately.
+add_executable(mt_tests
+  test_tensor.cpp
+)
+target_link_libraries(mt_tests PRIVATE minitensor GTest::gtest_main)
+mt_set_warnings(mt_tests)
 
-# Registers every TEST() in the executable as a separate ctest test.
-gtest_discover_tests(test_hello)
+gtest_discover_tests(mt_tests)

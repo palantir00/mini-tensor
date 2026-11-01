@@ -19,6 +19,11 @@ function(mt_set_warnings target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
 endfunction()
 
+# --- Library ------------------------------------------------------------------
+add_library(minitensor src/tensor.cpp)
+target_include_directories(minitensor PUBLIC include)
+mt_set_warnings(minitensor)
+
 # --- GoogleTest (pinned release, verified by hash) --------------------------
 include(FetchContent)
 FetchContent_Declare(
