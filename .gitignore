@@ -1,0 +1,20 @@
+# Build directories
+build/
+build-*/
+
+# Editor / IDE settings (personal)
+.vscode/
+.idea/
+
+# Python (scripts/ from stage 5)
+.venv/
+venv/
+__pycache__/
+
+# Local AI assistant context (kept out of the repo by choice)
+CLAUDE.md
+.claude/
+
+# Local study notes (PDF in docs/, its sources in private/), never pushed
+private/
+docs/mini-tensor-notatki.pdf
