@@ -20,7 +20,10 @@ function(mt_set_warnings target)
 endfunction()
 
 # --- Library ------------------------------------------------------------------
-add_library(minitensor src/tensor.cpp)
+add_library(minitensor
+  src/tensor.cpp
+  src/ops.cpp
+)
 target_include_directories(minitensor PUBLIC include)
 mt_set_warnings(minitensor)
 

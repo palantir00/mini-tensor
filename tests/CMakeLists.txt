@@ -4,6 +4,7 @@ include(GoogleTest)
 add_executable(mt_tests
   test_tensor.cpp
   test_views.cpp
+  test_ops.cpp
 )
 target_link_libraries(mt_tests PRIVATE minitensor GTest::gtest_main)
 mt_set_warnings(mt_tests)

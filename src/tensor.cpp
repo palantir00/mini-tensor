@@ -1,5 +1,7 @@
 #include "minitensor/tensor.hpp"
 
+#include "internal.hpp"
+
 #include <algorithm>
 #include <random>
 #include <stdexcept>
@@ -9,7 +11,9 @@
 
 namespace mt {
 
-namespace {
+// --- Helpers shared with ops.cpp (declared in internal.hpp) --------------------------
+
+namespace detail {
 
 std::string shape_to_string(const Shape& shape) {
     std::string s = "[";
@@ -20,11 +24,23 @@ std::string shape_to_string(const Shape& shape) {
     return s + "]";
 }
 
+std::int64_t wrap_dim(std::int64_t dim, std::int64_t ndim, const char* where) {
+    if (dim < -ndim || dim >= ndim) {
+        throw std::out_of_range(std::string(where) + ": dim " + std::to_string(dim) +
+                                " is out of range for a tensor with " + std::to_string(ndim) + " dimensions");
+    }
+    return dim < 0 ? dim + ndim : dim;
+}
+
+}  // namespace detail
+
+namespace {
+
 void check_shape(const Shape& shape, const char* where) {
     for (std::size_t d = 0; d < shape.size(); ++d) {
         if (shape[d] < 0) {
             throw std::invalid_argument(std::string(where) + ": negative size in shape " +
-                                        shape_to_string(shape));
+                                        detail::shape_to_string(shape));
         }
     }
 }
@@ -81,17 +97,8 @@ void gather_elements(const TensorImpl& t, std::size_t d, std::int64_t pos, std::
     }
 }
 
-// Maps dim from [-ndim, ndim) to [0, ndim); -1 is the last dimension.
-std::int64_t wrap_dim(std::int64_t dim, std::int64_t ndim, const char* where) {
-    if (dim < -ndim || dim >= ndim) {
-        throw std::out_of_range(std::string(where) + ": dim " + std::to_string(dim) +
-                                " is out of range for a tensor with " + std::to_string(ndim) + " dimensions");
-    }
-    return dim < 0 ? dim + ndim : dim;
-}
-
 std::invalid_argument reshape_error(const Shape& shape, std::int64_t n) {
-    return std::invalid_argument("reshape: shape " + shape_to_string(shape) + " is invalid for " +
+    return std::invalid_argument("reshape: shape " + detail::shape_to_string(shape) + " is invalid for " +
                                  std::to_string(n) + " elements");
 }
 
@@ -163,6 +170,8 @@ float& Tensor::at(const Index& index) {
     return impl_->storage->data[static_cast<std::size_t>(storage_index(index))];
 }
 
+const float* Tensor::data_ptr() const { return impl_->storage->data.data() + impl_->offset; }
+
 std::vector<float> Tensor::to_vector() const {
     std::vector<float> out;
     out.reserve(static_cast<std::size_t>(numel()));
@@ -190,8 +199,8 @@ Tensor Tensor::make_view(Shape shape, Strides strides, std::int64_t offset) cons
 }
 
 Tensor Tensor::transpose(std::int64_t dim0, std::int64_t dim1) const {
-    const std::int64_t d0 = wrap_dim(dim0, dim(), "transpose");
-    const std::int64_t d1 = wrap_dim(dim1, dim(), "transpose");
+    const std::int64_t d0 = detail::wrap_dim(dim0, dim(), "transpose");
+    const std::int64_t d1 = detail::wrap_dim(dim1, dim(), "transpose");
     Shape shape = impl_->shape;
     Strides strides = impl_->strides;
     std::swap(shape[d0], shape[d1]);
@@ -200,7 +209,7 @@ Tensor Tensor::transpose(std::int64_t dim0, std::int64_t dim1) const {
 }
 
 Tensor Tensor::slice(std::int64_t dim, std::int64_t start, std::int64_t end, std::int64_t step) const {
-    const std::int64_t d = wrap_dim(dim, this->dim(), "slice");  // the parameter hides the method dim()
+    const std::int64_t d = detail::wrap_dim(dim, this->dim(), "slice");  // the parameter hides the method dim()
     if (step <= 0) {
         throw std::invalid_argument("slice: step must be positive, got " + std::to_string(step));
     }
@@ -241,6 +250,29 @@ Tensor Tensor::contiguous() const {
     return from_data(to_vector(), impl_->shape);
 }
 
+Tensor Tensor::expand(const Shape& shape) const {
+    check_shape(shape, "expand");
+    const std::int64_t added = static_cast<std::int64_t>(shape.size()) - dim();  // new dims on the left
+    if (added < 0) {
+        throw std::invalid_argument("expand: cannot expand shape " + detail::shape_to_string(impl_->shape) +
+                                    " to " + detail::shape_to_string(shape) + " with fewer dimensions");
+    }
+    // Stride 0 = "do not move in storage": every index along that dimension reads the same element.
+    // New dims on the left and stretched size-1 dims get stride 0; matching dims keep their stride.
+    Strides strides(shape.size(), 0);
+    for (std::int64_t d = 0; d < dim(); ++d) {
+        const std::int64_t size = impl_->shape[d];
+        if (size == shape[added + d]) {
+            strides[added + d] = impl_->strides[d];
+        } else if (size != 1) {
+            throw std::invalid_argument("expand: cannot expand shape " + detail::shape_to_string(impl_->shape) +
+                                        " to " + detail::shape_to_string(shape) +
+                                        ": only dimensions of size 1 can be stretched");
+        }
+    }
+    return make_view(shape, std::move(strides), impl_->offset);
+}
+
 // --- Free functions -------------------------------------------------------------
 
 std::int64_t numel(const Shape& shape) {
@@ -260,12 +292,30 @@ Strides contiguous_strides(const Shape& shape) {
     return strides;
 }
 
+Shape broadcast_shapes(const Shape& a, const Shape& b) {
+    const std::size_t n = std::max(a.size(), b.size());
+    Shape out(n);
+    // i counts from the right (i = 0 is the last dimension); a missing dimension counts as size 1.
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::int64_t sa = i < a.size() ? a[a.size() - 1 - i] : 1;
+        const std::int64_t sb = i < b.size() ? b[b.size() - 1 - i] : 1;
+        if (sa != sb && sa != 1 && sb != 1) {
+            throw std::invalid_argument("broadcast_shapes: shapes " + detail::shape_to_string(a) + " and " +
+                                        detail::shape_to_string(b) + " are not broadcastable (sizes " +
+                                        std::to_string(sa) + " and " + std::to_string(sb) + " at dimension -" +
+                                        std::to_string(i + 1) + ")");
+        }
+        out[n - 1 - i] = (sa == 1) ? sb : sa;
+    }
+    return out;
+}
+
 Tensor from_data(std::vector<float> data, const Shape& shape) {
     check_shape(shape, "from_data");
     const std::int64_t n = numel(shape);
     if (static_cast<std::int64_t>(data.size()) != n) {
-        throw std::invalid_argument("from_data: shape " + shape_to_string(shape) + " needs " + std::to_string(n) +
-                                    " values, got " + std::to_string(data.size()));
+        throw std::invalid_argument("from_data: shape " + detail::shape_to_string(shape) + " needs " +
+                                    std::to_string(n) + " values, got " + std::to_string(data.size()));
     }
     return make_contiguous(std::move(data), shape);
 }

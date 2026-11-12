@@ -43,6 +43,10 @@ public:
     float at(const Index& index) const;
     float& at(const Index& index);
 
+    // Pointer to element [0, 0, ...] (storage start + offset), like torch's data_ptr().
+    // Element [i0, i1, ...] is data_ptr()[i0*strides()[0] + i1*strides()[1] + ...].
+    const float* data_ptr() const;
+
     // All elements in logical (row-major) order, whatever the strides are.
     std::vector<float> to_vector() const;
 
@@ -69,6 +73,12 @@ public:
     // This tensor if it is already contiguous, otherwise a contiguous copy.
     Tensor contiguous() const;
 
+    // Stretches this tensor to a bigger shape without copying (used by broadcasting).
+    // Shapes are matched from the right: new dims may be added on the left, and a dim of size 1
+    // may become any size. Both get stride 0, so all their indices read the same element.
+    // Careful: writing through at() to such a dim changes every position that shares the element.
+    Tensor expand(const Shape& shape) const;
+
     friend std::ostream& operator<<(std::ostream& os, const Tensor& t);
 
 private:
@@ -85,6 +95,11 @@ std::int64_t numel(const Shape& shape);
 
 // Row-major strides: the last dimension has stride 1.
 Strides contiguous_strides(const Shape& shape);
+
+// Result shape of broadcasting a with b (NumPy rules): shapes are matched from the right,
+// a missing dim counts as 1, two sizes fit if they are equal or one of them is 1.
+// Example: [3, 1] and [4] give [3, 4]. Throws std::invalid_argument if the shapes do not fit.
+Shape broadcast_shapes(const Shape& a, const Shape& b);
 
 // Factories; each returns a new contiguous tensor with its own storage.
 Tensor from_data(std::vector<float> data, const Shape& shape);

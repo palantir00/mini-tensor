@@ -198,6 +198,57 @@ TEST(Reshape, RejectsInvalidShape) {
     EXPECT_THROW(mt::zeros({0}).reshape({0, -1}), std::invalid_argument);  // -1 could be anything
 }
 
+// --- expand ---------------------------------------------------------------------
+
+TEST(Expand, SizeOneDimGetsStrideZero) {
+    mt::Tensor col = mt::from_data({1, 2}, {2, 1});
+    mt::Tensor e = col.expand({2, 3});
+    EXPECT_EQ(e.shape(), (mt::Shape{2, 3}));
+    EXPECT_EQ(e.strides(), (mt::Strides{1, 0}));
+    EXPECT_EQ(e.to_vector(), (Values{1, 1, 1, 2, 2, 2}));
+}
+
+TEST(Expand, AddsDimsOnTheLeft) {
+    mt::Tensor row = mt::from_data({10, 20, 30}, {3});
+    mt::Tensor e = row.expand({2, 3});
+    EXPECT_EQ(e.strides(), (mt::Strides{0, 1}));
+    EXPECT_EQ(e.to_vector(), (Values{10, 20, 30, 10, 20, 30}));
+
+    mt::Tensor s = mt::from_data({7}, {}).expand({2, 2});  // a scalar fills any shape
+    EXPECT_EQ(s.strides(), (mt::Strides{0, 0}));
+    EXPECT_EQ(s.to_vector(), (Values{7, 7, 7, 7}));
+}
+
+TEST(Expand, KeepsStridesAndOffsetOfMatchingDims) {
+    mt::Tensor t = matrix_2x3().transpose(0, 1).expand({4, 3, 2});  // strides [1, 3] -> [0, 1, 3]
+    EXPECT_EQ(t.strides(), (mt::Strides{0, 1, 3}));
+
+    mt::Tensor row1 = matrix_2x3().slice(0, 1, 2).expand({3, 3});  // [[4, 5, 6]] starts at offset 3
+    EXPECT_EQ(row1.strides(), (mt::Strides{0, 1}));
+    EXPECT_EQ(row1.offset(), 3);
+    EXPECT_EQ(row1.to_vector(), (Values{4, 5, 6, 4, 5, 6, 4, 5, 6}));
+}
+
+TEST(Expand, IsNotContiguousAndSharesElements) {
+    mt::Tensor row = mt::from_data({10, 20, 30}, {3});
+    mt::Tensor e = row.expand({2, 3});
+    EXPECT_FALSE(e.is_contiguous());
+    e.at({1, 0}) = 42;  // both rows read the same storage element
+    EXPECT_FLOAT_EQ(e.at({0, 0}), 42);
+    EXPECT_FLOAT_EQ(row.at({0}), 42);
+
+    mt::Tensor c = e.contiguous();  // the copy has 6 elements of its own
+    EXPECT_EQ(c.strides(), (mt::Strides{3, 1}));
+    EXPECT_EQ(c.to_vector(), (Values{42, 20, 30, 42, 20, 30}));
+}
+
+TEST(Expand, RejectsInvalidShape) {
+    mt::Tensor a = matrix_2x3();
+    EXPECT_THROW(a.expand({4, 3}), std::invalid_argument);  // size 2 is not 1
+    EXPECT_THROW(a.expand({3}), std::invalid_argument);     // fewer dims
+    EXPECT_THROW(a.expand({2, -1}), std::invalid_argument);
+}
+
 // --- Views and const, printing ----------------------------------------------------
 
 TEST(Views, ConstHandleDoesNotMeanConstData) {
