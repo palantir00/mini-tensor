@@ -231,6 +231,154 @@ TEST(OpsBackward, SumAlongDimCopiesGradientBack) {
     EXPECT_EQ(grad_of(x), (Values{1, 2, 3, 1, 2, 3}));
 }
 
+// --- Views: their own nodes and gradient formulas ---------------------------------------
+
+TEST(ViewsBackward, ViewOfTensorWithGradRecordsNode) {
+    mt::Tensor x = param({1, 2, 3, 4, 5, 6}, {2, 3});
+    mt::Tensor t = x.transpose(0, 1);
+    EXPECT_TRUE(t.requires_grad());
+    EXPECT_FALSE(t.is_leaf());
+    ASSERT_NE(t.grad_fn(), nullptr);
+    EXPECT_STREQ(t.grad_fn()->name(), "TransposeBackward");
+    EXPECT_TRUE(t.grad_fn()->inputs()[0].is_same(x));
+    EXPECT_EQ(t.data_ptr(), x.data_ptr());  // still a view: same storage, nothing copied
+
+    EXPECT_STREQ(x.slice(1, 0, 2).grad_fn()->name(), "SliceBackward");
+    EXPECT_STREQ(x.reshape({3, 2}).grad_fn()->name(), "ReshapeBackward");
+    EXPECT_STREQ(x.expand({4, 2, 3}).grad_fn()->name(), "ExpandBackward");
+}
+
+TEST(ViewsBackward, NoNodeWithoutGradOrUnderGuard) {
+    mt::Tensor plain = mt::ones({2, 3});
+    EXPECT_TRUE(plain.transpose(0, 1).is_leaf());
+    EXPECT_FALSE(plain.slice(1, 0, 2).requires_grad());
+
+    mt::Tensor x = param({1, 2, 3, 4, 5, 6}, {2, 3});
+    mt::NoGradGuard no_grad;
+    EXPECT_TRUE(x.transpose(0, 1).is_leaf());
+    EXPECT_FALSE(x.reshape({6}).requires_grad());
+}
+
+TEST(ViewsBackward, TransposeSendsGradientBackTransposed) {
+    mt::Tensor x = param({1, 2, 3, 4, 5, 6}, {2, 3});
+    mt::Tensor w = mt::from_data({10, 20, 30, 40, 50, 60}, {3, 2});
+    mt::sum(x.transpose(0, 1) * w).backward();  // x[i][j] meets w[j][i]
+    EXPECT_EQ(x.grad()->shape(), (mt::Shape{2, 3}));
+    EXPECT_EQ(grad_of(x), (Values{10, 30, 50, 20, 40, 60}));
+}
+
+TEST(ViewsBackward, SliceGivesZerosWhereNothingWasTaken) {
+    mt::Tensor x = param({1, 2, 3, 4, 5}, {5});
+    mt::Tensor w = mt::from_data({10, 20}, {2});
+    mt::sum(x.slice(0, 1, 5, 2) * w).backward();  // takes x[1] and x[3]
+    EXPECT_EQ(grad_of(x), (Values{0, 10, 0, 20, 0}));
+}
+
+TEST(ViewsBackward, SliceAlongLastDim) {
+    mt::Tensor x = param({1, 2, 3, 4, 5, 6}, {2, 3});
+    mt::Tensor w = mt::from_data({1, 2, 3, 4}, {2, 2});
+    mt::sum(x.slice(-1, 1, 3) * w).backward();  // columns 1 and 2
+    EXPECT_EQ(grad_of(x), (Values{0, 1, 2, 0, 3, 4}));
+}
+
+TEST(ViewsBackward, OverlappingSlicesAddUp) {
+    mt::Tensor x = param({1, 2, 3, 4, 5}, {5});
+    mt::sum(x.slice(0, 0, 3) + x.slice(0, 2, 5)).backward();
+    EXPECT_EQ(grad_of(x), (Values{1, 1, 2, 1, 1}));  // x[2] is in both slices
+}
+
+TEST(ViewsBackward, ReshapeSendsGradientBackInOriginalShape) {
+    mt::Tensor x = param({1, 2, 3, 4, 5, 6}, {2, 3});
+    mt::Tensor w = mt::from_data({10, 20, 30, 40, 50, 60}, {3, 2});
+    mt::sum(x.reshape({3, 2}) * w).backward();
+    EXPECT_EQ(x.grad()->shape(), (mt::Shape{2, 3}));
+    EXPECT_EQ(grad_of(x), (Values{10, 20, 30, 40, 50, 60}));  // the same row-major order
+}
+
+TEST(ViewsBackward, ReshapeOfNonContiguousGoesThroughCopy) {
+    mt::Tensor x = param({1, 2, 3, 4, 5, 6}, {2, 3});
+    mt::Tensor y = x.transpose(0, 1).reshape({6});  // a copy: [x00, x10, x01, x11, x02, x12]
+    ASSERT_NE(y.grad_fn(), nullptr);
+    EXPECT_STREQ(y.grad_fn()->name(), "ReshapeBackward");
+    const mt::Tensor& copy = y.grad_fn()->inputs()[0];
+    ASSERT_NE(copy.grad_fn(), nullptr);
+    EXPECT_STREQ(copy.grad_fn()->name(), "ContiguousBackward");
+    EXPECT_STREQ(copy.grad_fn()->inputs()[0].grad_fn()->name(), "TransposeBackward");
+
+    mt::sum(y * mt::from_data({1, 2, 3, 4, 5, 6}, {6})).backward();
+    EXPECT_EQ(grad_of(x), (Values{1, 3, 5, 2, 4, 6}));
+}
+
+TEST(ViewsBackward, ContiguousNodeOnlyWhenItCopies) {
+    mt::Tensor x = param({1, 2, 3, 4, 5, 6}, {2, 3});
+    EXPECT_TRUE(x.contiguous().is_same(x));  // already row-major: the same tensor, still a leaf
+    mt::Tensor c = x.transpose(0, 1).contiguous();
+    ASSERT_NE(c.grad_fn(), nullptr);
+    EXPECT_STREQ(c.grad_fn()->name(), "ContiguousBackward");
+    mt::sum(c * mt::from_data({10, 20, 30, 40, 50, 60}, {3, 2})).backward();
+    EXPECT_EQ(grad_of(x), (Values{10, 30, 50, 20, 40, 60}));  // same as transpose alone
+}
+
+TEST(ViewsBackward, ExpandSumsOverCopies) {
+    mt::Tensor x = param({1, 2, 3}, {3, 1});
+    mt::sum(x.expand({2, 3, 4})).backward();
+    EXPECT_EQ(x.grad()->shape(), (mt::Shape{3, 1}));
+    EXPECT_EQ(grad_of(x), (Values{8, 8, 8}));  // each element appears 2 * 4 times
+}
+
+// --- Graph ownership and memory ---------------------------------------------------------
+// Ownership points backwards only: result -> its node -> the node's inputs -> their nodes ...
+// A weak_ptr watches a node without owning it; expired() becomes true once the node is freed.
+
+TEST(Graph, NodeIsFreedWithItsResult) {
+    mt::Tensor x = param({1, 2}, {2});
+    std::weak_ptr<mt::Node> node;
+    std::weak_ptr<mt::Node> view_node;
+    {
+        mt::Tensor y = x * x;
+        mt::Tensor t = x.reshape({2, 1});
+        node = y.grad_fn();
+        view_node = t.grad_fn();
+        EXPECT_FALSE(node.expired());
+        EXPECT_FALSE(view_node.expired());
+    }
+    EXPECT_TRUE(node.expired());  // y and t were the only owners of their nodes
+    EXPECT_TRUE(view_node.expired());
+}
+
+TEST(Graph, ConsumerKeepsIntermediateAlive) {
+    mt::Tensor x = param({1, 2}, {2});
+    std::weak_ptr<mt::Node> inner;
+    std::weak_ptr<mt::Node> outer;
+    {
+        mt::Tensor y = x * x;
+        mt::Tensor z = y + x;
+        inner = y.grad_fn();
+        outer = z.grad_fn();
+        y = mt::ones({1});              // rebinds the handle, like `y = ...` in Python
+        EXPECT_FALSE(inner.expired());  // still owned: z -> AddBackward -> old y -> MulBackward
+        mt::sum(z).backward();
+        EXPECT_FALSE(inner.expired());  // backward does not free the graph (PyTorch does)
+        EXPECT_EQ(grad_of(x), (Values{3, 5}));  // 2x + 1
+    }
+    EXPECT_TRUE(outer.expired());  // the whole chain goes with z
+    EXPECT_TRUE(inner.expired());
+}
+
+TEST(Graph, GradHoldsNoGraph) {
+    mt::Tensor x = param({-1, 2, 3}, {3});
+    std::weak_ptr<mt::Node> node;
+    {
+        mt::Tensor loss = mt::sum(mt::relu(x) * x.slice(0, 0, 3));  // a view node in the graph too
+        node = loss.grad_fn();
+        loss.backward();
+    }
+    EXPECT_TRUE(node.expired());  // nothing made during backward keeps the graph alive
+    ASSERT_TRUE(x.grad().has_value());
+    EXPECT_TRUE(x.grad()->is_leaf());  // computed under NoGradGuard: plain numbers, no grad_fn
+    EXPECT_FALSE(x.grad()->requires_grad());
+}
+
 // --- Gradcheck: backward() against numerical derivatives --------------------------------
 
 TEST(Gradcheck, ElementwiseWithBroadcasting) {
@@ -260,6 +408,28 @@ TEST(Gradcheck, Reductions) {
             const mt::Tensor& t = in[0];
             return mt::sum(t, 0, true) * t + mt::sum(t * t, 1, true) - mt::mean(t);
         },
+        {x}));
+}
+
+TEST(Gradcheck, AllViews) {
+    mt::Tensor x = mt::randn({3, 4}, 9).set_requires_grad(true);
+    mt::Tensor w = mt::randn({3, 2}, 10).set_requires_grad(true);
+    EXPECT_TRUE(mt_test::gradcheck(
+        [](const std::vector<mt::Tensor>& in) {
+            const mt::Tensor& x = in[0];                                   // [3, 4]
+            const mt::Tensor cols = x.slice(1, 1, 4, 2);                   // [3, 2]: columns 1 and 3
+            const mt::Tensor m = mt::matmul(cols.transpose(0, 1), in[1]);  // [2, 3] @ [3, 2] = [2, 2]
+            const mt::Tensor rows = m.reshape({1, 4}).expand({3, 4});      // the same row 3 times
+            return rows * x.transpose(0, 1).reshape({3, 4});               // copy, then regroup
+        },
+        {x, w}));
+}
+
+TEST(Gradcheck, SlicesOfThreeDimTensor) {
+    // Slices along the middle dim (outer and inner both > 1); x[:, 1] is in both slices.
+    mt::Tensor x = mt::randn({2, 5, 3}, 11).set_requires_grad(true);
+    EXPECT_TRUE(mt_test::gradcheck(
+        [](const std::vector<mt::Tensor>& in) { return in[0].slice(1, -4, 5, 2) * in[0].slice(1, 0, 2); },
         {x}));
 }
 

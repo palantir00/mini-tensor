@@ -1,13 +1,17 @@
 #include "minitensor/tensor.hpp"
 
+#include "minitensor/autograd.hpp"
+
 #include "internal.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace mt {
 
@@ -30,6 +34,13 @@ std::int64_t wrap_dim(std::int64_t dim, std::int64_t ndim, const char* where) {
                                 " is out of range for a tensor with " + std::to_string(ndim) + " dimensions");
     }
     return dim < 0 ? dim + ndim : dim;
+}
+
+Block block_around(const Shape& shape, std::int64_t d) {
+    Block b{1, shape[d], 1};
+    for (std::int64_t k = 0; k < d; ++k) b.outer *= shape[k];
+    for (std::int64_t k = d + 1; k < static_cast<std::int64_t>(shape.size()); ++k) b.inner *= shape[k];
+    return b;
 }
 
 }  // namespace detail
@@ -217,6 +228,90 @@ std::ostream& operator<<(std::ostream& os, const Tensor& t) {
 }
 
 // --- Views ----------------------------------------------------------------------
+// If the input needs a gradient, every view also records a node (formulas below).
+// A view only rearranges elements: each element of the result is exactly one element of the
+// input, taken with weight 1, so the gradient goes back the same way, rearranged in reverse.
+// expand is the exception: one input element appears many times, so its gradients are summed,
+// just like for a tensor that is used several times.
+
+namespace {
+
+// Y = X.transpose(d0, d1):  dX = dY.transpose(d0, d1)  (swapping the same pair again undoes it).
+class TransposeBackward : public Node {
+public:
+    TransposeBackward(std::vector<Tensor> inputs, std::int64_t dim0, std::int64_t dim1)
+        : Node(std::move(inputs)), dim0_(dim0), dim1_(dim1) {}
+    const char* name() const override { return "TransposeBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override { return {grad.transpose(dim0_, dim1_)}; }
+
+private:
+    std::int64_t dim0_;  // both already wrapped to [0, ndim)
+    std::int64_t dim1_;
+};
+
+// Y = X.slice(d, start, end, step):  Y[.., r, ..] = X[.., start + r * step, ..].
+// dX equals dY at the positions the slice took and is 0 elsewhere (those elements do not affect Y).
+// With X seen as a block [outer, size, inner] around d and dY as [outer, n, inner]:
+//     dX[o, start + r * step, i] = dY[o, r, i]
+// The mirror image of sum(dim): there we read along d and add up, here we write along d.
+class SliceBackward : public Node {
+public:
+    SliceBackward(std::vector<Tensor> inputs, std::int64_t dim, std::int64_t start, std::int64_t step)
+        : Node(std::move(inputs)), dim_(dim), start_(start), step_(step) {}
+    const char* name() const override { return "SliceBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        const Shape& shape = inputs()[0].shape();
+        const detail::Block x = detail::block_around(shape, dim_);
+        const std::int64_t n = grad.shape()[dim_];  // how many positions the slice took along d
+        const Tensor g = grad.contiguous();         // the index formula needs row-major order
+        const float* src = g.data_ptr();
+        std::vector<float> out(static_cast<std::size_t>(numel(shape)), 0.0f);
+        for (std::int64_t o = 0; o < x.outer; ++o) {
+            for (std::int64_t r = 0; r < n; ++r) {
+                for (std::int64_t i = 0; i < x.inner; ++i) {
+                    out[static_cast<std::size_t>((o * x.size + start_ + r * step_) * x.inner + i)] =
+                        src[(o * n + r) * x.inner + i];
+                }
+            }
+        }
+        return {from_data(std::move(out), shape)};
+    }
+
+private:
+    std::int64_t dim_;    // wrapped to [0, ndim)
+    std::int64_t start_;  // after the Python rules and clamping; end follows from dY's size
+    std::int64_t step_;
+};
+
+// Y = X.reshape(shape):  the same elements in the same row-major order, only grouped differently,
+// so dX = dY.reshape(X.shape).
+class ReshapeBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "ReshapeBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override { return {grad.reshape(inputs()[0].shape())}; }
+};
+
+// Y = X.expand(shape):  one element of X appears in many places of Y, so its gradient is the sum
+// over all of them. That is exactly sum_to_shape, the rule broadcasting in add already uses.
+class ExpandBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "ExpandBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        return {detail::sum_to_shape(grad, inputs()[0].shape())};
+    }
+};
+
+// Y = X.contiguous() when it copies:  the same values in a new buffer, so dX = dY.
+class ContiguousBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "ContiguousBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override { return {grad}; }
+};
+
+}  // namespace
 
 Tensor Tensor::make_view(Shape shape, Strides strides, std::int64_t offset) const {
     auto impl = std::make_shared<TensorImpl>();
@@ -234,7 +329,11 @@ Tensor Tensor::transpose(std::int64_t dim0, std::int64_t dim1) const {
     Strides strides = impl_->strides;
     std::swap(shape[d0], shape[d1]);
     std::swap(strides[d0], strides[d1]);
-    return make_view(std::move(shape), std::move(strides), impl_->offset);
+    Tensor out = make_view(std::move(shape), std::move(strides), impl_->offset);
+    if (detail::should_record({*this})) {
+        out.set_grad_fn(std::make_shared<TransposeBackward>(std::vector<Tensor>{*this}, d0, d1));
+    }
+    return out;
 }
 
 Tensor Tensor::slice(std::int64_t dim, std::int64_t start, std::int64_t end, std::int64_t step) const {
@@ -253,15 +352,22 @@ Tensor Tensor::slice(std::int64_t dim, std::int64_t start, std::int64_t end, std
     Strides strides = impl_->strides;
     shape[d] = (end - start + step - 1) / step;  // ceil((end - start) / step)
     strides[d] *= step;                          // jump over step-1 elements each time
-    return make_view(std::move(shape), std::move(strides), impl_->offset + start * impl_->strides[d]);
+    Tensor out = make_view(std::move(shape), std::move(strides), impl_->offset + start * impl_->strides[d]);
+    if (detail::should_record({*this})) {
+        out.set_grad_fn(std::make_shared<SliceBackward>(std::vector<Tensor>{*this}, d, start, step));
+    }
+    return out;
 }
 
 Tensor Tensor::reshape(const Shape& shape) const {
     const Shape new_shape = infer_shape(shape, numel());
     // Row-major strides fit the new shape only if the elements already lie in row-major order,
-    // so a non-contiguous tensor is copied first.
+    // so a non-contiguous tensor is copied first. With autograd that gives two nodes in a row,
+    // ContiguousBackward (recorded by contiguous()) and ReshapeBackward, each with its own formula.
     const Tensor src = contiguous();
-    return src.make_view(new_shape, contiguous_strides(new_shape), src.offset());
+    Tensor out = src.make_view(new_shape, contiguous_strides(new_shape), src.offset());
+    if (detail::should_record({src})) out.set_grad_fn(std::make_shared<ReshapeBackward>(std::vector<Tensor>{src}));
+    return out;
 }
 
 bool Tensor::is_contiguous() const {
@@ -275,8 +381,12 @@ bool Tensor::is_contiguous() const {
 }
 
 Tensor Tensor::contiguous() const {
-    if (is_contiguous()) return *this;
-    return from_data(to_vector(), impl_->shape);
+    if (is_contiguous()) return *this;  // the same tensor: no copy, so no node is needed either
+    Tensor out = from_data(to_vector(), impl_->shape);
+    if (detail::should_record({*this})) {
+        out.set_grad_fn(std::make_shared<ContiguousBackward>(std::vector<Tensor>{*this}));
+    }
+    return out;
 }
 
 Tensor Tensor::expand(const Shape& shape) const {
@@ -299,7 +409,9 @@ Tensor Tensor::expand(const Shape& shape) const {
                                         ": only dimensions of size 1 can be stretched");
         }
     }
-    return make_view(shape, std::move(strides), impl_->offset);
+    Tensor out = make_view(shape, std::move(strides), impl_->offset);
+    if (detail::should_record({*this})) out.set_grad_fn(std::make_shared<ExpandBackward>(std::vector<Tensor>{*this}));
+    return out;
 }
 
 // --- Free functions -------------------------------------------------------------

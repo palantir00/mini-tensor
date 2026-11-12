@@ -44,6 +44,14 @@ NoGradGuard::NoGradGuard() : previous_(grad_enabled) { grad_enabled = false; }
 
 NoGradGuard::~NoGradGuard() { grad_enabled = previous_; }
 
+bool detail::should_record(const std::vector<Tensor>& inputs) {
+    if (!grad_enabled) return false;
+    for (const Tensor& t : inputs) {
+        if (t.requires_grad()) return true;
+    }
+    return false;
+}
+
 // --- Engine -----------------------------------------------------------------------------
 // Members of Tensor, defined here next to the rest of autograd.
 

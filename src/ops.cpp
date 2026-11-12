@@ -16,6 +16,10 @@ namespace mt {
 namespace {
 
 // --- Forward helpers ----------------------------------------------------------------------
+// They only compute values; each public operation below records one node with its own formula.
+// Views they use internally (broadcast expand, row-major copy) run under NoGradGuard: they are
+// implementation details, and recording them would only allocate nodes that die right away.
+// (In PyTorch the kernels run "below" autograd for the same reason.)
 
 // Combines two numbers into one, e.g. x + y. A lambda without captures converts to this type.
 using BinaryFn = float (*)(float, float);
@@ -38,6 +42,7 @@ void walk_pair(const Tensor& a, const Tensor& b, std::size_t d, std::int64_t pa,
 // Broadcasts a and b to a common shape (views with stride 0, nothing is copied),
 // then applies fn to every pair of elements.
 Tensor elementwise(const Tensor& a, const Tensor& b, BinaryFn fn) {
+    NoGradGuard no_grad;  // ea and eb are internal; the caller's node already undoes broadcasting
     const Shape shape = broadcast_shapes(a.shape(), b.shape());
     const Tensor ea = a.expand(shape);
     const Tensor eb = b.expand(shape);
@@ -54,19 +59,27 @@ float sum_values(const Tensor& t) {
     return total;
 }
 
-Tensor scalar(float value) { return from_data({value}, {}); }
-
-// --- Autograd helpers ---------------------------------------------------------------------
-
-// Should the result of an operation on `inputs` record a node? Only while recording is on
-// (no NoGradGuard alive) and at least one input needs a gradient; otherwise autograd costs nothing.
-bool should_record(const std::vector<Tensor>& inputs) {
-    if (!is_grad_enabled()) return false;
-    for (const Tensor& t : inputs) {
-        if (t.requires_grad()) return true;
+// Sums t along dimension d (already wrapped); returns the result's values in row-major order.
+// Seen as a block [outer, size, inner] around d (detail::block_around), element (o, r, i) of t
+// is at (o * size + r) * inner + i, and we add up over r.
+// Example: [2, 3, 4] summed over dim 1 -> outer 2, size 3, inner 4, result [2, 4].
+std::vector<float> sum_dim_values(const Tensor& t, std::int64_t d) {
+    NoGradGuard no_grad;              // c is an internal copy; the public sum records a node for t
+    const Tensor c = t.contiguous();  // the formula needs row-major order; copies only if t is not
+    const detail::Block b = detail::block_around(c.shape(), d);
+    const float* src = c.data_ptr();
+    std::vector<float> out(static_cast<std::size_t>(b.outer * b.inner), 0.0f);
+    for (std::int64_t o = 0; o < b.outer; ++o) {
+        for (std::int64_t r = 0; r < b.size; ++r) {
+            for (std::int64_t i = 0; i < b.inner; ++i) {
+                out[static_cast<std::size_t>(o * b.inner + i)] += src[(o * b.size + r) * b.inner + i];
+            }
+        }
     }
-    return false;
+    return out;
 }
+
+Tensor scalar(float value) { return from_data({value}, {}); }
 
 // --- Backward nodes: one gradient formula per operation -----------------------------------
 // backward(grad) gets dC = d loss / d result and returns d loss / d input for every input.
@@ -198,19 +211,19 @@ Tensor sum_to_shape(const Tensor& g, const Shape& shape) {
 
 Tensor add(const Tensor& a, const Tensor& b) {
     Tensor out = elementwise(a, b, [](float x, float y) { return x + y; });
-    if (should_record({a, b})) out.set_grad_fn(std::make_shared<AddBackward>(std::vector<Tensor>{a, b}));
+    if (detail::should_record({a, b})) out.set_grad_fn(std::make_shared<AddBackward>(std::vector<Tensor>{a, b}));
     return out;
 }
 
 Tensor sub(const Tensor& a, const Tensor& b) {
     Tensor out = elementwise(a, b, [](float x, float y) { return x - y; });
-    if (should_record({a, b})) out.set_grad_fn(std::make_shared<SubBackward>(std::vector<Tensor>{a, b}));
+    if (detail::should_record({a, b})) out.set_grad_fn(std::make_shared<SubBackward>(std::vector<Tensor>{a, b}));
     return out;
 }
 
 Tensor mul(const Tensor& a, const Tensor& b) {
     Tensor out = elementwise(a, b, [](float x, float y) { return x * y; });
-    if (should_record({a, b})) out.set_grad_fn(std::make_shared<MulBackward>(std::vector<Tensor>{a, b}));
+    if (detail::should_record({a, b})) out.set_grad_fn(std::make_shared<MulBackward>(std::vector<Tensor>{a, b}));
     return out;
 }
 
@@ -223,7 +236,7 @@ Tensor relu(const Tensor& t) {
     // std::max(x, 0) returns x when the comparison x < 0 is false, so NaN stays NaN.
     for (float& x : values) x = std::max(x, 0.0f);
     Tensor out = from_data(std::move(values), t.shape());
-    if (should_record({t})) out.set_grad_fn(std::make_shared<ReluBackward>(std::vector<Tensor>{t}));
+    if (detail::should_record({t})) out.set_grad_fn(std::make_shared<ReluBackward>(std::vector<Tensor>{t}));
     return out;
 }
 
@@ -264,7 +277,7 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
         }
     }
     Tensor result = from_data(std::move(out), {m, n});
-    if (should_record({a, b})) result.set_grad_fn(std::make_shared<MatmulBackward>(std::vector<Tensor>{a, b}));
+    if (detail::should_record({a, b})) result.set_grad_fn(std::make_shared<MatmulBackward>(std::vector<Tensor>{a, b}));
     return result;
 }
 
@@ -272,49 +285,26 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
 
 Tensor sum(const Tensor& t) {
     Tensor out = scalar(sum_values(t));
-    if (should_record({t})) out.set_grad_fn(std::make_shared<SumBackward>(std::vector<Tensor>{t}));
+    if (detail::should_record({t})) out.set_grad_fn(std::make_shared<SumBackward>(std::vector<Tensor>{t}));
     return out;
 }
 
 Tensor sum(const Tensor& t, std::int64_t dim, bool keepdim) {
     const std::int64_t d = detail::wrap_dim(dim, t.dim(), "sum");
-
-    // A row-major tensor can be seen as a block [outer, size, inner]:
-    //   outer = product of the sizes before d, size = shape[d], inner = product of the sizes after d.
-    // Element (o, r, i) is at (o * size + r) * inner + i, and we add up over r.
-    // Example: [2, 3, 4] summed over dim 1 -> outer 2, size 3, inner 4, result [2, 4].
-    const Tensor c = t.contiguous();  // the formula needs row-major order; copies only if t is not
-    const Shape& shape = c.shape();
-    std::int64_t outer = 1;
-    for (std::int64_t k = 0; k < d; ++k) outer *= shape[k];
-    const std::int64_t size = shape[d];
-    std::int64_t inner = 1;
-    for (std::int64_t k = d + 1; k < c.dim(); ++k) inner *= shape[k];
-
-    const float* src = c.data_ptr();
-    std::vector<float> out(static_cast<std::size_t>(outer * inner), 0.0f);
-    for (std::int64_t o = 0; o < outer; ++o) {
-        for (std::int64_t r = 0; r < size; ++r) {
-            for (std::int64_t i = 0; i < inner; ++i) {
-                out[static_cast<std::size_t>(o * inner + i)] += src[(o * size + r) * inner + i];
-            }
-        }
-    }
-
-    Shape out_shape = shape;
+    Shape out_shape = t.shape();
     if (keepdim) {
         out_shape[d] = 1;
     } else {
         out_shape.erase(out_shape.begin() + d);
     }
-    Tensor result = from_data(std::move(out), out_shape);
-    if (should_record({t})) result.set_grad_fn(std::make_shared<SumDimBackward>(std::vector<Tensor>{t}, d));
+    Tensor result = from_data(sum_dim_values(t, d), out_shape);
+    if (detail::should_record({t})) result.set_grad_fn(std::make_shared<SumDimBackward>(std::vector<Tensor>{t}, d));
     return result;
 }
 
 Tensor mean(const Tensor& t) {
     Tensor out = scalar(sum_values(t) / static_cast<float>(t.numel()));
-    if (should_record({t})) out.set_grad_fn(std::make_shared<MeanBackward>(std::vector<Tensor>{t}));
+    if (detail::should_record({t})) out.set_grad_fn(std::make_shared<MeanBackward>(std::vector<Tensor>{t}));
     return out;
 }
 

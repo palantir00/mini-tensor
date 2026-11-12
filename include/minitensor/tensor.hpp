@@ -63,6 +63,8 @@ public:
 
     // --- Views: new tensors over the same storage, no data is copied ---
     // Negative dims count from the end (-1 is the last dimension), as in PyTorch.
+    // Views are differentiable: on a tensor with requires_grad each one records a node, so the
+    // gradient flows back through it (and through the copy that reshape/contiguous may make).
 
     // Swaps two dimensions (their sizes and strides).
     Tensor transpose(std::int64_t dim0, std::int64_t dim1) const;

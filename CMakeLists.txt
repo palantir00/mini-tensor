@@ -19,6 +19,20 @@ function(mt_set_warnings target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
 endfunction()
 
+# --- Sanitizers (optional, in a separate build directory) -------------------
+#   cmake -S . -B build-asan -G Ninja -DMT_SANITIZE=ON
+# AddressSanitizer: out-of-bounds access, use after free; on Linux it includes LeakSanitizer
+# (memory still allocated at exit that nothing points to, e.g. a shared_ptr cycle).
+# UndefinedBehaviorSanitizer: signed overflow, bad shifts, misaligned pointers, ...
+# -fno-sanitize-recover=all: stop at the first error. By default UBSan only prints a message
+# and carries on, so the test would still pass. Set for every target (GoogleTest too), before
+# any target is defined, so that all code and the final link use the same runtime.
+option(MT_SANITIZE "Build with AddressSanitizer (+LeakSanitizer) and UndefinedBehaviorSanitizer" OFF)
+if(MT_SANITIZE)
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined)
+endif()
+
 # --- Library ------------------------------------------------------------------
 add_library(minitensor
   src/tensor.cpp
