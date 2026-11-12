@@ -1,5 +1,6 @@
 #include "minitensor/tensor.hpp"
 
+#include <algorithm>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -69,6 +70,54 @@ void print_elements(std::ostream& os, const TensorImpl& t, std::size_t d, std::i
     os << ']';
 }
 
+// Same walk as print_elements, but appends the numbers to out instead of printing them.
+void gather_elements(const TensorImpl& t, std::size_t d, std::int64_t pos, std::vector<float>& out) {
+    if (d == t.shape.size()) {
+        out.push_back(t.storage->data[static_cast<std::size_t>(pos)]);
+        return;
+    }
+    for (std::int64_t i = 0; i < t.shape[d]; ++i) {
+        gather_elements(t, d + 1, pos + i * t.strides[d], out);
+    }
+}
+
+// Maps dim from [-ndim, ndim) to [0, ndim); -1 is the last dimension.
+std::int64_t wrap_dim(std::int64_t dim, std::int64_t ndim, const char* where) {
+    if (dim < -ndim || dim >= ndim) {
+        throw std::out_of_range(std::string(where) + ": dim " + std::to_string(dim) +
+                                " is out of range for a tensor with " + std::to_string(ndim) + " dimensions");
+    }
+    return dim < 0 ? dim + ndim : dim;
+}
+
+std::invalid_argument reshape_error(const Shape& shape, std::int64_t n) {
+    return std::invalid_argument("reshape: shape " + shape_to_string(shape) + " is invalid for " +
+                                 std::to_string(n) + " elements");
+}
+
+// Validates a reshape target for n elements and replaces a single -1 with the missing size.
+Shape infer_shape(Shape shape, std::int64_t n) {
+    std::int64_t known = 1;      // product of the sizes that are given
+    std::int64_t infer_at = -1;  // position of the -1, if there is one
+    for (std::int64_t d = 0; d < static_cast<std::int64_t>(shape.size()); ++d) {
+        if (shape[d] == -1 && infer_at == -1) {
+            infer_at = d;
+        } else if (shape[d] < 0) {  // any other negative size, or a second -1
+            throw reshape_error(shape, n);
+        } else {
+            known *= shape[d];
+        }
+    }
+    if (infer_at == -1) {
+        if (known != n) throw reshape_error(shape, n);
+    } else {
+        // known == 0: any size would fit, so the -1 is ambiguous (PyTorch rejects it too).
+        if (known == 0 || n % known != 0) throw reshape_error(shape, n);
+        shape[infer_at] = n / known;
+    }
+    return shape;
+}
+
 }  // namespace
 
 // --- Tensor -------------------------------------------------------------------
@@ -114,12 +163,82 @@ float& Tensor::at(const Index& index) {
     return impl_->storage->data[static_cast<std::size_t>(storage_index(index))];
 }
 
+std::vector<float> Tensor::to_vector() const {
+    std::vector<float> out;
+    out.reserve(static_cast<std::size_t>(numel()));
+    gather_elements(*impl_, 0, impl_->offset, out);
+    return out;
+}
+
 bool Tensor::is_same(const Tensor& other) const { return impl_ == other.impl_; }
 
 std::ostream& operator<<(std::ostream& os, const Tensor& t) {
     os << kPrintPrefix;
     print_elements(os, *t.impl_, 0, t.impl_->offset);
     return os << ')';
+}
+
+// --- Views ----------------------------------------------------------------------
+
+Tensor Tensor::make_view(Shape shape, Strides strides, std::int64_t offset) const {
+    auto impl = std::make_shared<TensorImpl>();
+    impl->storage = impl_->storage;  // the pointer is copied, the data is shared
+    impl->shape = std::move(shape);
+    impl->strides = std::move(strides);
+    impl->offset = offset;
+    return Tensor(std::move(impl));
+}
+
+Tensor Tensor::transpose(std::int64_t dim0, std::int64_t dim1) const {
+    const std::int64_t d0 = wrap_dim(dim0, dim(), "transpose");
+    const std::int64_t d1 = wrap_dim(dim1, dim(), "transpose");
+    Shape shape = impl_->shape;
+    Strides strides = impl_->strides;
+    std::swap(shape[d0], shape[d1]);
+    std::swap(strides[d0], strides[d1]);
+    return make_view(std::move(shape), std::move(strides), impl_->offset);
+}
+
+Tensor Tensor::slice(std::int64_t dim, std::int64_t start, std::int64_t end, std::int64_t step) const {
+    const std::int64_t d = wrap_dim(dim, this->dim(), "slice");  // the parameter hides the method dim()
+    if (step <= 0) {
+        throw std::invalid_argument("slice: step must be positive, got " + std::to_string(step));
+    }
+    const std::int64_t size = impl_->shape[d];
+    // Python rules: negative bounds count from the end, then both are clamped to [0, size].
+    if (start < 0) start += size;
+    if (end < 0) end += size;
+    start = std::clamp<std::int64_t>(start, 0, size);
+    end = std::clamp<std::int64_t>(end, start, size);  // end before start gives an empty slice
+
+    Shape shape = impl_->shape;
+    Strides strides = impl_->strides;
+    shape[d] = (end - start + step - 1) / step;  // ceil((end - start) / step)
+    strides[d] *= step;                          // jump over step-1 elements each time
+    return make_view(std::move(shape), std::move(strides), impl_->offset + start * impl_->strides[d]);
+}
+
+Tensor Tensor::reshape(const Shape& shape) const {
+    const Shape new_shape = infer_shape(shape, numel());
+    // Row-major strides fit the new shape only if the elements already lie in row-major order,
+    // so a non-contiguous tensor is copied first.
+    const Tensor src = contiguous();
+    return src.make_view(new_shape, contiguous_strides(new_shape), src.offset());
+}
+
+bool Tensor::is_contiguous() const {
+    std::int64_t expected = 1;  // stride that row-major order needs for dimension d
+    for (std::int64_t d = dim() - 1; d >= 0; --d) {
+        if (impl_->shape[d] == 1) continue;  // only index 0 exists, so this stride is never used
+        if (impl_->strides[d] != expected) return false;
+        expected *= impl_->shape[d];
+    }
+    return true;
+}
+
+Tensor Tensor::contiguous() const {
+    if (is_contiguous()) return *this;
+    return from_data(to_vector(), impl_->shape);
 }
 
 // --- Free functions -------------------------------------------------------------
