@@ -4,4 +4,5 @@
 # much larger CUDA build from PyPI by mistake.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.15.0+cpu
-numpy==2.5.4  # not used directly; without it torch warns at import (matplotlib needs it later)
+numpy==2.5.4       # needed by matplotlib; without it torch also warns at import
+matplotlib==3.11.2  # scripts/plot_loss.py

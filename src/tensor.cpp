@@ -108,6 +108,18 @@ void gather_elements(const TensorImpl& t, std::size_t d, std::int64_t pos, std::
     }
 }
 
+// Same walk again, writing: subtracts src[next], src[next + 1], ... from the elements in logical order.
+void subtract_elements(TensorImpl& t, std::size_t d, std::int64_t pos, const std::vector<float>& src,
+                       std::size_t& next) {
+    if (d == t.shape.size()) {
+        t.storage->data[static_cast<std::size_t>(pos)] -= src[next++];
+        return;
+    }
+    for (std::int64_t i = 0; i < t.shape[d]; ++i) {
+        subtract_elements(t, d + 1, pos + i * t.strides[d], src, next);
+    }
+}
+
 std::invalid_argument reshape_error(const Shape& shape, std::int64_t n) {
     return std::invalid_argument("reshape: shape " + detail::shape_to_string(shape) + " is invalid for " +
                                  std::to_string(n) + " elements");
@@ -219,6 +231,23 @@ std::shared_ptr<Node> Tensor::grad_fn() const { return impl_->grad_fn; }
 void Tensor::set_grad_fn(std::shared_ptr<Node> node) {
     impl_->grad_fn = std::move(node);
     impl_->requires_grad = true;
+}
+
+// --- In-place update --------------------------------------------------------------------
+
+void Tensor::sub_(const Tensor& other) {
+    if (requires_grad() && is_grad_enabled()) {
+        throw std::logic_error("sub_: cannot change a tensor that requires grad while autograd is recording "
+                               "(the graph may need its old values); run the update under NoGradGuard");
+    }
+    if (other.shape() != shape()) {
+        throw std::invalid_argument("sub_: shape " + detail::shape_to_string(other.shape()) + " does not match " +
+                                    detail::shape_to_string(shape()));
+    }
+    // Copy other first: it may share storage with this tensor (w.sub_(w), or a view of w).
+    const std::vector<float> values = other.to_vector();
+    std::size_t next = 0;
+    subtract_elements(*impl_, 0, impl_->offset, values, next);
 }
 
 std::ostream& operator<<(std::ostream& os, const Tensor& t) {

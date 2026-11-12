@@ -123,6 +123,15 @@ public:
     void backward() const;
     void backward(const Tensor& grad) const;
 
+    // --- In-place update (the trailing _ marks in-place operations, as in PyTorch) ---
+
+    // this -= other, element by element, written into this tensor's storage (through a view it
+    // changes the base too). other must have the same shape. This is the optimizer step:
+    //     { NoGradGuard no_grad; w.sub_(lr * w.grad().value()); }
+    // Throws std::logic_error for a tensor with requires_grad while recording is on: the graph may
+    // have saved this tensor for backward, and changing it would silently break the gradients.
+    void sub_(const Tensor& other);
+
     friend std::ostream& operator<<(std::ostream& os, const Tensor& t);
 
 private:

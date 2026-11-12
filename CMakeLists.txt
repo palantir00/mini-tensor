@@ -53,6 +53,7 @@ set(BUILD_GMOCK OFF)    # we only need gtest, not gmock
 set(INSTALL_GTEST OFF)  # do not install gtest together with our project
 FetchContent_MakeAvailable(googletest)
 
-# --- Tests ------------------------------------------------------------------
+# --- Tests and examples -----------------------------------------------------
 enable_testing()
 add_subdirectory(tests)
+add_subdirectory(examples)  # examples/xor_mlp, also registered as a test

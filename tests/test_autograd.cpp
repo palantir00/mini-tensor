@@ -462,3 +462,63 @@ TEST(Gradcheck, CatchesWrongFormula) {
     mt::Tensor x = mt::randn({3}, 8).set_requires_grad(true);
     EXPECT_FALSE(mt_test::gradcheck([](const std::vector<mt::Tensor>& in) { return wrong_square(in[0]); }, {x}));
 }
+
+// --- In-place update: the optimizer step ------------------------------------------------
+
+TEST(InPlace, SubChangesTheTensorItself) {
+    mt::Tensor t = mt::from_data({1, 2, 3, 4}, {2, 2});
+    const mt::Tensor alias = t;  // same tensor, so it sees the change
+    t.sub_(mt::from_data({0.5f, 1, 1.5f, 2}, {2, 2}));
+    EXPECT_EQ(alias.to_vector(), (Values{0.5f, 1, 1.5f, 2}));
+}
+
+TEST(InPlace, SubThroughViewChangesBase) {
+    mt::Tensor base = mt::from_data({1, 2, 3, 4, 5, 6}, {2, 3});
+    base.slice(1, 0, 3, 2).sub_(mt::ones({2, 2}));  // columns 0 and 2, strides [3, 2]
+    EXPECT_EQ(base.to_vector(), (Values{0, 2, 2, 3, 5, 5}));
+}
+
+TEST(InPlace, SubReadsOtherInLogicalOrder) {
+    mt::Tensor t = mt::zeros({2, 2});
+    t.sub_(mt::from_data({1, 2, 3, 4}, {2, 2}).transpose(0, 1));  // [[1, 3], [2, 4]]
+    EXPECT_EQ(t.to_vector(), (Values{-1, -3, -2, -4}));
+}
+
+TEST(InPlace, SubWithOverlappingViewUsesOldValues) {
+    // t[1:4] -= t[0:3]: both views share the storage of t. Every element must use the old value
+    // of its left neighbour, not one that was already changed: 2-1, 3-2, 4-3.
+    mt::Tensor t = mt::from_data({1, 2, 3, 4}, {4});
+    t.slice(0, 1, 4).sub_(t.slice(0, 0, 3));
+    EXPECT_EQ(t.to_vector(), (Values{1, 1, 1, 1}));  // without copying other first: {1, 1, 2, 2}
+}
+
+TEST(InPlace, SubRejectsDifferentShape) {
+    mt::Tensor t = mt::zeros({2, 3});
+    EXPECT_THROW(t.sub_(mt::ones({3, 2})), std::invalid_argument);
+    EXPECT_THROW(t.sub_(mt::ones({3})), std::invalid_argument);  // no broadcasting
+}
+
+TEST(InPlace, SubOnGradTensorOnlyUnderGuard) {
+    mt::Tensor w = param({1, 2}, {2});
+    EXPECT_THROW(w.sub_(mt::ones({2})), std::logic_error);
+    EXPECT_EQ(w.to_vector(), (Values{1, 2}));  // unchanged
+    {
+        mt::NoGradGuard no_grad;
+        w.sub_(mt::ones({2}));
+    }
+    EXPECT_EQ(w.to_vector(), (Values{0, 1}));
+    EXPECT_TRUE(w.requires_grad());  // still a parameter, still a leaf
+    EXPECT_TRUE(w.is_leaf());
+}
+
+TEST(InPlace, SgdStepMovesAgainstTheGradient) {
+    // loss = sum(w * w), d loss / dw = 2w, so one step with lr 0.25 halves w.
+    mt::Tensor w = param({2, -4}, {2});
+    mt::sum(w * w).backward();
+    {
+        mt::NoGradGuard no_grad;
+        w.sub_(mt::from_data({0.25f}, {}) * w.grad().value());
+    }
+    EXPECT_EQ(w.to_vector(), (Values{1, -2}));     // 2 - 0.25 * 4, -4 - 0.25 * (-8)
+    EXPECT_FLOAT_EQ(mt::sum(w * w).at({}), 5.0f);  // the loss was 20
+}
