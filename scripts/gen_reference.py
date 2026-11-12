@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Reference data for the C++ tests: PyTorch computes, mini-tensor must agree.
+
+For every case below: draw the inputs with a fixed seed, compute `out` in PyTorch, run
+backward and write everything to tests/data/<case>.txt. The files are committed, so the
+C++ tests (tests/test_reference.cpp) do not need PyTorch. Every case has a twin TEST
+there with the same name: the expression is written once in Python and once in C++.
+
+Run from the repo root (setup in scripts/requirements.txt):
+    .venv/bin/python scripts/gen_reference.py
+Running it again gives the same files, so `git diff` after a rerun should be empty.
+
+File format (plain text, one file per case):
+    # comment lines: torch version, seed, expression
+    <name> <size> <size> ...      shape of the tensor (just the name for a scalar)
+    <v> <v> <v> ...               its values in row-major order, all on one line
+for every input, then "out", "grad_out" (left out when out is a scalar, which uses
+backward() without arguments) and "grad_<input>" for every input that requires grad.
+"""
+
+import platform
+from pathlib import Path
+
+import torch
+
+SEED = 0
+DATA_DIR = Path(__file__).resolve().parent.parent / "tests" / "data"
+
+
+def leaf(*shape):
+    """Random N(0, 1) input that takes part in autograd."""
+    return torch.randn(*shape, requires_grad=True)
+
+
+# --- Cases ------------------------------------------------------------------------------
+# Name = function name, expression = docstring. Each returns (inputs by name, out).
+# Inputs created with requires_grad get a gradient in the file; the others (the data x, y
+# of the MLP) do not.
+
+def add_broadcast():
+    """out = a + b"""
+    a, b = leaf(3, 1), leaf(4)
+    return {"a": a, "b": b}, a + b
+
+
+def sub_broadcast():
+    """out = a - b"""
+    a, b = leaf(2, 3), leaf(3)
+    return {"a": a, "b": b}, a - b
+
+
+def mul_broadcast_3d():
+    """out = a * b"""
+    a, b = leaf(2, 1, 3), leaf(4, 1)
+    return {"a": a, "b": b}, a * b
+
+
+def matmul():
+    """out = a @ b"""
+    a, b = leaf(4, 3), leaf(3, 5)
+    return {"a": a, "b": b}, a @ b
+
+
+def matmul_transposed():
+    """out = a.transpose(0, 1) @ b"""
+    a, b = leaf(3, 4), leaf(3, 5)
+    return {"a": a, "b": b}, a.transpose(0, 1) @ b
+
+
+def relu():
+    """out = relu(x)"""
+    x = leaf(4, 5)
+    return {"x": x}, torch.relu(x)
+
+
+def sum_dim_keepdim():
+    """out = x.sum(dim=1, keepdim=True)"""
+    x = leaf(2, 3, 4)
+    return {"x": x}, x.sum(dim=1, keepdim=True)
+
+
+def sum_last_dim():
+    """out = x.sum(dim=-1)"""
+    x = leaf(2, 3, 4)
+    return {"x": x}, x.sum(dim=-1)
+
+
+def sum_times_mean():
+    """out = a.sum() * b.mean()"""
+    a, b = leaf(3, 4), leaf(2, 5)
+    return {"a": a, "b": b}, a.sum() * b.mean()
+
+
+def views_chain():
+    """out = x.transpose(0, 1)[1:4:2].reshape(1, 6).expand(2, 6)"""
+    x = leaf(3, 4)
+    return {"x": x}, x.transpose(0, 1)[1:4:2].reshape(1, 6).expand(2, 6)
+
+
+def slice_3d():
+    """out = x[:, 1:5:2] * x[:, 0:2]"""
+    x = leaf(2, 5, 3)
+    return {"x": x}, x[:, 1:5:2] * x[:, 0:2]
+
+
+def reused_input():
+    """out = x * x + x"""
+    x = leaf(2, 3)
+    return {"x": x}, x * x + x
+
+
+def mlp():
+    """h = relu(x @ w1 + b1); d = h @ w2 + b2 - y; out = mean(d * d)   (XOR data, 2 -> 8 -> 1)"""
+    x = torch.tensor([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+    y = torch.tensor([[0.0], [1.0], [1.0], [0.0]])
+    w1, b1, w2, b2 = leaf(2, 8), leaf(8), leaf(8, 1), leaf(1)
+    h = torch.relu(x @ w1 + b1)
+    d = h @ w2 + b2 - y
+    return {"x": x, "y": y, "w1": w1, "b1": b1, "w2": w2, "b2": b2}, (d * d).mean()
+
+
+CASES = [
+    add_broadcast, sub_broadcast, mul_broadcast_3d, matmul, matmul_transposed, relu,
+    sum_dim_keepdim, sum_last_dim, sum_times_mean, views_chain, slice_3d, reused_input, mlp,
+]
+
+
+# --- Writing ----------------------------------------------------------------------------
+
+def tensor_block(name, t):
+    """Two lines: name and shape, then the values in row-major order."""
+    assert t.dtype == torch.float32, f"{name}: mini-tensor only has float32"
+    header = " ".join([name, *(str(size) for size in t.shape)])
+    # 9 significant digits are enough for every float32 to come back unchanged:
+    # float32 -> text -> nearest float32 gives the same number, bit for bit.
+    values = " ".join(f"{v:.9g}" for v in t.detach().reshape(-1).tolist())
+    return f"{header}\n{values}\n"
+
+
+def run_case(fn):
+    name = fn.__name__
+    torch.manual_seed(SEED)  # every case starts from the same seed: a new case changes no other file
+    inputs, out = fn()
+    for key in inputs:
+        assert key != "out" and not key.startswith("grad_"), f"{name}: reserved input name {key}"
+
+    grad_out = None
+    if out.dim() == 0:
+        out.backward()
+    else:
+        # Random, not ones: with ones a bug can hide, e.g. a missing transpose of a square matrix.
+        grad_out = torch.randn(out.shape)
+        out.backward(grad_out)
+
+    text = (
+        "# mini-tensor reference data. Generated by scripts/gen_reference.py, do not edit by hand.\n"
+        f"# torch {torch.__version__}, python {platform.python_version()}, seed {SEED}\n"
+        f"# case {name}: {fn.__doc__}\n"
+    )
+    text += "".join(tensor_block(key, t) for key, t in inputs.items())
+    text += tensor_block("out", out)
+    if grad_out is not None:
+        text += tensor_block("grad_out", grad_out)
+    for key, t in inputs.items():
+        if t.requires_grad:
+            assert t.grad is not None, f"{name}: {key} got no gradient"
+            text += tensor_block(f"grad_{key}", t.grad)
+    (DATA_DIR / f"{name}.txt").write_text(text)
+
+
+def main():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for old in DATA_DIR.glob("*.txt"):  # a removed or renamed case must not leave its file behind
+        old.unlink()
+    for fn in CASES:
+        run_case(fn)
+    print(f"torch {torch.__version__}: wrote {len(CASES)} files to {DATA_DIR}")
+
+
+if __name__ == "__main__":
+    main()

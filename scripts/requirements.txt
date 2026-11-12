@@ -1,0 +1,7 @@
+# Python tools for mini-tensor (the C++ library and its tests do not need them).
+#   python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
+# The "+cpu" build of torch exists only on the PyTorch index, so pip cannot pick the
+# much larger CUDA build from PyPI by mistake.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+numpy==2.5.4  # not used directly; without it torch warns at import (matplotlib needs it later)
