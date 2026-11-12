@@ -17,4 +17,10 @@ std::string shape_to_string(const Shape& shape);
 // Throws std::out_of_range otherwise; `where` names the calling function in the message.
 std::int64_t wrap_dim(std::int64_t dim, std::int64_t ndim, const char* where);
 
+// Reverse of broadcasting, used by the backward formulas: sums g over the dimensions that
+// broadcasting added on the left or stretched from 1, so that the result has `shape`.
+// Example: g [3, 4] -> [4] sums dim 0; g [3, 4] -> [3, 1] sums dim 1 with keepdim.
+// `shape` must broadcast to g.shape(). Defined in ops.cpp.
+Tensor sum_to_shape(const Tensor& g, const Shape& shape);
+
 }  // namespace mt::detail

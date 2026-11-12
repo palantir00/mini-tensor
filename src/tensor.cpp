@@ -181,6 +181,35 @@ std::vector<float> Tensor::to_vector() const {
 
 bool Tensor::is_same(const Tensor& other) const { return impl_ == other.impl_; }
 
+// --- Autograd state (the engine itself is in autograd.cpp) --------------------------------
+
+bool Tensor::requires_grad() const { return impl_->requires_grad; }
+
+Tensor Tensor::set_requires_grad(bool value) {
+    if (!is_leaf()) {
+        throw std::logic_error("set_requires_grad: only leaves can change requires_grad; "
+                               "the result of an operation gets it from its inputs");
+    }
+    impl_->requires_grad = value;
+    return *this;
+}
+
+bool Tensor::is_leaf() const { return impl_->grad_fn == nullptr; }
+
+std::optional<Tensor> Tensor::grad() const {
+    if (!impl_->grad) return std::nullopt;
+    return Tensor(impl_->grad);
+}
+
+void Tensor::zero_grad() { impl_->grad.reset(); }
+
+std::shared_ptr<Node> Tensor::grad_fn() const { return impl_->grad_fn; }
+
+void Tensor::set_grad_fn(std::shared_ptr<Node> node) {
+    impl_->grad_fn = std::move(node);
+    impl_->requires_grad = true;
+}
+
 std::ostream& operator<<(std::ostream& os, const Tensor& t) {
     os << kPrintPrefix;
     print_elements(os, *t.impl_, 0, t.impl_->offset);

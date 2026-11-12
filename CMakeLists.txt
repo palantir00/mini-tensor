@@ -23,6 +23,7 @@ endfunction()
 add_library(minitensor
   src/tensor.cpp
   src/ops.cpp
+  src/autograd.cpp
 )
 target_include_directories(minitensor PUBLIC include)
 mt_set_warnings(minitensor)

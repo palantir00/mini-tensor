@@ -1,8 +1,11 @@
 #include "minitensor/ops.hpp"
 
+#include "minitensor/autograd.hpp"
+
 #include "internal.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -11,6 +14,8 @@
 namespace mt {
 
 namespace {
+
+// --- Forward helpers ----------------------------------------------------------------------
 
 // Combines two numbers into one, e.g. x + y. A lambda without captures converts to this type.
 using BinaryFn = float (*)(float, float);
@@ -42,20 +47,171 @@ Tensor elementwise(const Tensor& a, const Tensor& b, BinaryFn fn) {
     return from_data(std::move(out), shape);
 }
 
+// Sum of all elements, read in logical order.
+float sum_values(const Tensor& t) {
+    float total = 0.0f;
+    for (float x : t.to_vector()) total += x;
+    return total;
+}
+
+Tensor scalar(float value) { return from_data({value}, {}); }
+
+// --- Autograd helpers ---------------------------------------------------------------------
+
+// Should the result of an operation on `inputs` record a node? Only while recording is on
+// (no NoGradGuard alive) and at least one input needs a gradient; otherwise autograd costs nothing.
+bool should_record(const std::vector<Tensor>& inputs) {
+    if (!is_grad_enabled()) return false;
+    for (const Tensor& t : inputs) {
+        if (t.requires_grad()) return true;
+    }
+    return false;
+}
+
+// --- Backward nodes: one gradient formula per operation -----------------------------------
+// backward(grad) gets dC = d loss / d result and returns d loss / d input for every input.
+// inputs() are the tensors the operation was called with, saved when the node was recorded.
+// `using Node::Node;` reuses Node's constructor, the one that takes the inputs.
+// backward() runs under NoGradGuard, so the operations used here record nothing.
+
+// C = A + B:  dA = dC, dB = dC, each summed back to its input's shape (undoes broadcasting).
+class AddBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "AddBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        return {detail::sum_to_shape(grad, inputs()[0].shape()),
+                detail::sum_to_shape(grad, inputs()[1].shape())};
+    }
+};
+
+// C = A - B:  dA = dC, dB = -dC.
+class SubBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "SubBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        return {detail::sum_to_shape(grad, inputs()[0].shape()),
+                detail::sum_to_shape(mul(grad, scalar(-1.0f)), inputs()[1].shape())};
+    }
+};
+
+// C = A * B (element-wise):  dA = dC * B, dB = dC * A.
+class MulBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "MulBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        const Tensor& a = inputs()[0];
+        const Tensor& b = inputs()[1];
+        return {detail::sum_to_shape(mul(grad, b), a.shape()), detail::sum_to_shape(mul(grad, a), b.shape())};
+    }
+};
+
+// Y = relu(X):  dX = dY * [X > 0]  (0 at X = 0, as in PyTorch).
+// Saves the input X, not the result Y: the result owns this node, so a node holding the
+// result would form a cycle (result -> node -> result) that is never freed.
+class ReluBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "ReluBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        const Tensor& x = inputs()[0];
+        std::vector<float> mask = x.to_vector();
+        for (float& v : mask) v = v > 0.0f ? 1.0f : 0.0f;
+        return {mul(grad, from_data(std::move(mask), x.shape()))};
+    }
+};
+
+// C = A @ B with A [m, k], B [k, n], dC [m, n]:
+//   dA = dC @ B^T   ([m, n] @ [n, k] = [m, k])
+//   dB = A^T @ dC   ([k, m] @ [m, n] = [k, n])
+// The transposes are views; matmul reads them through strides, nothing is copied.
+class MatmulBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "MatmulBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        const Tensor& a = inputs()[0];
+        const Tensor& b = inputs()[1];
+        return {matmul(grad, b.transpose(0, 1)), matmul(a.transpose(0, 1), grad)};
+    }
+};
+
+// s = sum(X):  every element of X adds to s with weight 1, so dX = ds at every position.
+// expand gives that without copying (stride 0); backward() stores a contiguous copy in grad().
+class SumBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "SumBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override { return {grad.expand(inputs()[0].shape())}; }
+};
+
+// S = sum(X, dim):  each element of X adds to one element of S with weight 1, so dS is copied
+// back along dim. dS is first brought to keepdim form ([2] -> [2, 1]), then expanded to X's shape.
+class SumDimBackward : public Node {
+public:
+    SumDimBackward(std::vector<Tensor> inputs, std::int64_t dim) : Node(std::move(inputs)), dim_(dim) {}
+    const char* name() const override { return "SumDimBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        const Tensor& x = inputs()[0];
+        Shape kept = x.shape();
+        kept[dim_] = 1;
+        return {grad.reshape(kept).expand(x.shape())};
+    }
+
+private:
+    std::int64_t dim_;  // already wrapped to [0, ndim)
+};
+
+// m = mean(X) = sum(X) / n:  dX = dm / n at every position.
+class MeanBackward : public Node {
+public:
+    using Node::Node;
+    const char* name() const override { return "MeanBackward"; }
+    std::vector<Tensor> backward(const Tensor& grad) const override {
+        const Tensor& x = inputs()[0];
+        const Tensor scaled = mul(grad, scalar(1.0f / static_cast<float>(x.numel())));
+        return {scaled.expand(x.shape())};
+    }
+};
+
 }  // namespace
 
-// --- Element-wise -----------------------------------------------------------------
+namespace detail {
+
+Tensor sum_to_shape(const Tensor& g, const Shape& shape) {
+    Tensor result = g;
+    // Dimensions that broadcasting added on the left: sum them away (each time the first one).
+    const std::int64_t added = result.dim() - static_cast<std::int64_t>(shape.size());
+    for (std::int64_t i = 0; i < added; ++i) result = sum(result, 0);
+    // Dimensions that broadcasting stretched from 1: sum them back to size 1.
+    for (std::int64_t d = 0; d < result.dim(); ++d) {
+        if (shape[d] == 1 && result.shape()[d] != 1) result = sum(result, d, true);
+    }
+    return result;
+}
+
+}  // namespace detail
+
+// --- Element-wise -------------------------------------------------------------------------
 
 Tensor add(const Tensor& a, const Tensor& b) {
-    return elementwise(a, b, [](float x, float y) { return x + y; });
+    Tensor out = elementwise(a, b, [](float x, float y) { return x + y; });
+    if (should_record({a, b})) out.set_grad_fn(std::make_shared<AddBackward>(std::vector<Tensor>{a, b}));
+    return out;
 }
 
 Tensor sub(const Tensor& a, const Tensor& b) {
-    return elementwise(a, b, [](float x, float y) { return x - y; });
+    Tensor out = elementwise(a, b, [](float x, float y) { return x - y; });
+    if (should_record({a, b})) out.set_grad_fn(std::make_shared<SubBackward>(std::vector<Tensor>{a, b}));
+    return out;
 }
 
 Tensor mul(const Tensor& a, const Tensor& b) {
-    return elementwise(a, b, [](float x, float y) { return x * y; });
+    Tensor out = elementwise(a, b, [](float x, float y) { return x * y; });
+    if (should_record({a, b})) out.set_grad_fn(std::make_shared<MulBackward>(std::vector<Tensor>{a, b}));
+    return out;
 }
 
 Tensor operator+(const Tensor& a, const Tensor& b) { return add(a, b); }
@@ -66,10 +222,12 @@ Tensor relu(const Tensor& t) {
     std::vector<float> values = t.to_vector();  // this copy becomes the result's buffer
     // std::max(x, 0) returns x when the comparison x < 0 is false, so NaN stays NaN.
     for (float& x : values) x = std::max(x, 0.0f);
-    return from_data(std::move(values), t.shape());
+    Tensor out = from_data(std::move(values), t.shape());
+    if (should_record({t})) out.set_grad_fn(std::make_shared<ReluBackward>(std::vector<Tensor>{t}));
+    return out;
 }
 
-// --- Matrix product ---------------------------------------------------------------
+// --- Matrix product -----------------------------------------------------------------------
 
 Tensor matmul(const Tensor& a, const Tensor& b) {
     if (a.dim() != 2 || b.dim() != 2) {
@@ -105,15 +263,17 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
             out[static_cast<std::size_t>(i * n + j)] = acc;
         }
     }
-    return from_data(std::move(out), {m, n});
+    Tensor result = from_data(std::move(out), {m, n});
+    if (should_record({a, b})) result.set_grad_fn(std::make_shared<MatmulBackward>(std::vector<Tensor>{a, b}));
+    return result;
 }
 
-// --- Reductions -------------------------------------------------------------------
+// --- Reductions ---------------------------------------------------------------------------
 
 Tensor sum(const Tensor& t) {
-    float total = 0.0f;
-    for (float x : t.to_vector()) total += x;
-    return from_data({total}, {});
+    Tensor out = scalar(sum_values(t));
+    if (should_record({t})) out.set_grad_fn(std::make_shared<SumBackward>(std::vector<Tensor>{t}));
+    return out;
 }
 
 Tensor sum(const Tensor& t, std::int64_t dim, bool keepdim) {
@@ -147,12 +307,15 @@ Tensor sum(const Tensor& t, std::int64_t dim, bool keepdim) {
     } else {
         out_shape.erase(out_shape.begin() + d);
     }
-    return from_data(std::move(out), out_shape);
+    Tensor result = from_data(std::move(out), out_shape);
+    if (should_record({t})) result.set_grad_fn(std::make_shared<SumDimBackward>(std::vector<Tensor>{t}, d));
+    return result;
 }
 
 Tensor mean(const Tensor& t) {
-    const float total = sum(t).at({});
-    return from_data({total / static_cast<float>(t.numel())}, {});
+    Tensor out = scalar(sum_values(t) / static_cast<float>(t.numel()));
+    if (should_record({t})) out.set_grad_fn(std::make_shared<MeanBackward>(std::vector<Tensor>{t}));
+    return out;
 }
 
 }  // namespace mt

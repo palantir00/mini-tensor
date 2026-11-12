@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <vector>
 
@@ -17,6 +18,8 @@ struct Storage {
     std::vector<float> data;
 };
 
+class Node;  // one recorded operation of the autograd graph, defined in autograd.hpp
+
 // What a tensor really is: a buffer plus the recipe for reading it.
 // Element [i0, i1, ...] lives at data[offset + i0*strides[0] + i1*strides[1] + ...].
 struct TensorImpl {
@@ -24,6 +27,11 @@ struct TensorImpl {
     Shape shape;
     Strides strides;          // in elements, not bytes
     std::int64_t offset = 0;  // position of element [0, 0, ...] in storage
+
+    // --- Autograd ---
+    bool requires_grad = false;        // does the gradient flow through this tensor?
+    std::shared_ptr<TensorImpl> grad;  // summed up by backward(); leaves only, nullptr = none yet
+    std::shared_ptr<Node> grad_fn;     // operation that produced this tensor; nullptr = leaf
 };
 
 // Lightweight handle: copying a Tensor copies the pointer, not the data,
@@ -79,9 +87,47 @@ public:
     // Careful: writing through at() to such a dim changes every position that shares the element.
     Tensor expand(const Shape& shape) const;
 
+    // --- Autograd (graph nodes and NoGradGuard in autograd.hpp) ---
+
+    // True if the gradient flows through this tensor: a leaf you marked, or a result computed from one.
+    bool requires_grad() const;
+
+    // Marks a leaf as a parameter whose gradient backward() should compute (false unmarks it).
+    // Only leaves: results of operations get requires_grad from their inputs (std::logic_error otherwise).
+    // Returns this tensor, so it can be chained: Tensor w = randn({2, 3}, 0).set_requires_grad(true);
+    Tensor set_requires_grad(bool value);
+
+    // True if the tensor was not produced by a recorded operation (it has no grad_fn).
+    bool is_leaf() const;
+
+    // Gradient summed up by backward(); empty before the first backward(), like None in PyTorch.
+    // Only leaves with requires_grad get one.
+    std::optional<Tensor> grad() const;
+
+    // Forgets the gradient (grad() is empty again), like zero_grad(set_to_none=True) in PyTorch.
+    void zero_grad();
+
+    // Operation that produced this tensor; nullptr for leaves.
+    std::shared_ptr<Node> grad_fn() const;
+
+    // Used by operations: attaches the node that produced this tensor and sets requires_grad.
+    void set_grad_fn(std::shared_ptr<Node> node);
+
+    // Runs the chain rule from this tensor back to the leaves and adds d this / d leaf to grad()
+    // of every leaf with requires_grad. Without an argument this tensor must have exactly one
+    // element (its gradient is then 1); otherwise pass d loss / d this, with the shape of this.
+    // Defined in autograd.cpp. Known limit: changing a tensor through at() after the graph used it
+    // silently breaks the gradients (PyTorch detects that with version counters; we do not).
+    void backward() const;
+    void backward(const Tensor& grad) const;
+
     friend std::ostream& operator<<(std::ostream& os, const Tensor& t);
 
 private:
+    // Adds g to the gradient of this leaf: an own copy the first time, in place afterwards.
+    // Defined in autograd.cpp.
+    void accumulate_grad(const Tensor& g) const;
+
     std::int64_t storage_index(const Index& index) const;
 
     // New tensor that shares this tensor's storage but reads it with a different layout.

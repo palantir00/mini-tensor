@@ -8,6 +8,8 @@ namespace mt {
 
 // Math on tensors. Every function returns a new contiguous tensor with its own storage;
 // the inputs are never modified and may have any layout (views, transposes, slices).
+// Autograd: if an input requires grad and no NoGradGuard is active, the result records a node
+// (its grad_fn) with the gradient formula, so that backward() can run through it.
 
 // --- Element-wise, with broadcasting ----------------------------------------------
 // The result has shape broadcast_shapes(a.shape(), b.shape()), e.g. [3, 1] + [4] -> [3, 4].
