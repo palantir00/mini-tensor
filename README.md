@@ -1,5 +1,7 @@
 # mini-tensor
 
+[![CI](https://github.com/palantir00/mini-tensor/actions/workflows/ci.yml/badge.svg)](https://github.com/palantir00/mini-tensor/actions/workflows/ci.yml)
+
 A small tensor library with reverse-mode automatic differentiation, written from scratch in C++17
 to understand how PyTorch works under the hood: strides and views, broadcasting, the autograd graph
 and the backward pass through it.
@@ -97,6 +99,10 @@ With AddressSanitizer, LeakSanitizer and UndefinedBehaviorSanitizer (any error f
 cmake -S . -B build-asan -G Ninja -DMT_SANITIZE=ON
 cmake --build build-asan && ctest --test-dir build-asan --output-on-failure
 ```
+
+`-DMT_WERROR=ON` turns warnings in the project's own code into errors. GitHub Actions
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) does that on every push and pull request: it builds
+with GCC 13 and Clang 18 in Release mode and runs all tests, plus a Debug build under the sanitizers.
 
 ### How it is tested
 

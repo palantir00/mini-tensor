@@ -15,8 +15,14 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Warnings for our own targets only; third-party code (GoogleTest) is not affected.
+# MT_WERROR turns them into errors. CI sets it, so no warning can get into main; it stays OFF
+# locally, so that a warning does not stop you while you experiment.
+option(MT_WERROR "Treat warnings in mini-tensor's own targets as errors" OFF)
 function(mt_set_warnings target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+  if(MT_WERROR)
+    target_compile_options(${target} PRIVATE -Werror)
+  endif()
 endfunction()
 
 # --- Sanitizers (optional, in a separate build directory) -------------------

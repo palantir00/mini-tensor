@@ -1,0 +1,65 @@
+# Builds mini-tensor and runs all tests (unit tests, gradient checks, PyTorch reference
+# comparison, XOR demo) on every push to main, on pull requests, and on demand.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:  # "Run workflow" button in the Actions tab
+
+# A newer push to the same branch cancels the run that is still going for the old one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The jobs only read the code.
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}, Release, warnings as errors
+    # A fixed image (the same Ubuntu as the WSL setup), not ubuntu-latest, which moves over time.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false  # if one compiler fails, still finish the other, to see both results
+      matrix:
+        include:
+          - name: GCC 13
+            cxx: g++-13
+          - name: Clang 18
+            cxx: clang++-18
+    steps:
+      - uses: actions/checkout@v7
+      # Release (-O3): some GCC warnings only appear with optimization, and so does some UB.
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DMT_WERROR=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: GCC 13, Debug, ASan + LSan + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # Debug: line numbers and full call stacks in sanitizer reports. Any report fails the test.
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=g++-13
+          -DMT_SANITIZE=ON
+          -DMT_WERROR=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
